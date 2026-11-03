@@ -157,6 +157,9 @@ def stop_services():
     for unit in reversed(UNITS):
         result = systemctl('show', '--property=LoadState', '--value', unit, check=False)
         if result.stdout.strip() == 'not-found':
+            # systemd removes dangling enablement links even though it returns
+            # failure for the missing unit file.
+            systemctl('disable', '--no-reload', unit, check=False)
             continue
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or f'Cannot query {unit}')

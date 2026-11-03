@@ -27,7 +27,7 @@ args = sys.argv[1:]
 action = args[1]
 units = [arg for arg in args[2:] if arg.endswith('.service')]
 if action == 'show':
-    print('loaded' if units[0] in states else 'not-found')
+    print(states[units[0]].get('load', 'loaded') if units[0] in states else 'not-found')
 elif action == 'is-enabled':
     print(states[units[0]]['enabled'])
 elif action == 'is-active':
@@ -37,6 +37,8 @@ elif action in ('enable', 'disable', 'start', 'stop'):
         if action == 'enable':
             states[unit]['enabled'] = 'enabled-runtime' if '--runtime' in args else 'enabled'
         elif action == 'disable':
+            if unit not in states:
+                continue
             states[unit]['enabled'] = 'disabled'
         if action in ('start', 'stop') or '--now' in args:
             states[unit]['active'] = action in ('enable', 'start')
@@ -154,9 +156,12 @@ class DesktopSwitchTests(unittest.TestCase):
 
     def test_disable_restores_configuration_after_unit_files_are_removed(self):
         self.command('enable')
-        self.services.write_text('{}')
+        self.services.write_text(json.dumps({unit: {'enabled': 'enabled', 'active': False,
+                                                    'load': 'not-found'} for unit in UNITS}))
         self.command('disable')
         self.assert_restored()
+        self.assertTrue(all(s['enabled'] == 'disabled'
+                            for s in json.loads(self.services.read_text()).values()))
 
     def test_only_enable_and_disable_are_accepted(self):
         self.command('install', success=False)
