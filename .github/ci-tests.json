@@ -28,6 +28,7 @@
     "kos-platform.status-panel-operations"
   ],
   "logic": [
+    "kos-desktop.switch",
     "kos-window.gtk-buttons-install",
     "kos-window.firefox-buttons-install",
     "kos-shell.language",

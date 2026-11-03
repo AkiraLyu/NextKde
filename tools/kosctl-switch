@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Enable or disable an installed NextKDE desktop for the current user."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+UNITS = ('kos-platform.service', 'kos-data.service', 'kos-shell.service')
+CONFIG_FILES = ('kwinrc', 'plasmashellrc')
+SHELL_ID = 'org.kos.desktop'
+
+
+def run(*args, check=True):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=30)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                           or f'{args[0]} exited with status {result.returncode}')
+    return result
+
+
+def systemctl(*args, check=True):
+    return run('systemctl', '--user', *args, check=check)
+
+
+def xdg_path(variable, default):
+    path = Path(os.environ.get(variable) or default)
+    if not path.is_absolute():
+        raise RuntimeError(f'{variable} must be an absolute path')
+    return path.resolve()
+
+
+def write_config(config, filename, group, key, value):
+    # Omitting --notify keeps native effects out of the running compositor.
+    run('kwriteconfig6', '--file', str(config / filename), '--group', group,
+        '--key', key, value)
+
+
+def switch_plasma(config):
+    shell = run('kreadconfig6', '--file', str(config / 'plasmashellrc'),
+                '--group', 'Shell', '--key', 'ShellPackage',
+                '--default', 'org.kde.plasma.desktop').stdout.strip()
+    result = run('busctl', '--user', '--timeout=5', 'call', 'org.kde.plasmashell',
+                 '/PlasmaShell', 'org.kde.PlasmaShell', 'changeShell', 's', shell,
+                 check=False)
+    if result.returncode:
+        print('Plasma will use the selected desktop at the next login.', file=sys.stderr)
+
+
+def atomic_copy(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=destination.parent, prefix='.kos-switch-')
+    os.close(descriptor)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def snapshot(config, state):
+    services = {}
+    for unit in UNITS:
+        if systemctl('show', '--property=LoadState', '--value', unit).stdout.strip() != 'loaded':
+            raise RuntimeError(f'{unit} is unavailable or masked; install NextKDE first')
+        enabled = systemctl('is-enabled', unit, check=False).stdout.strip()
+        if enabled not in ('enabled', 'enabled-runtime', 'disabled'):
+            raise RuntimeError(f'Unsupported enablement state for {unit}: {enabled}')
+        services[unit] = {'enabled': enabled,
+                          'active': systemctl('is-active', '--quiet', unit, check=False).returncode == 0}
+
+    backups = state / 'backups'
+    backups.mkdir(mode=0o700, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='desktop-', dir=backups))
+    manifest = {'version': 1, 'config': str(config), 'files': {}, 'services': services}
+    try:
+        for name in CONFIG_FILES:
+            path = config / name
+            if path.is_symlink() and not path.is_file():
+                raise RuntimeError(f'Configuration symlink has no regular file target: {path}')
+            if path.exists() and not path.is_file():
+                raise RuntimeError(f'Configuration is not a regular file: {path}')
+            entry = {'exists': path.exists(), 'link': os.readlink(path) if path.is_symlink() else None}
+            if path.exists():
+                shutil.copy2(path, backup / name)
+                entry['sha256'] = hashlib.sha256((backup / name).read_bytes()).hexdigest()
+            manifest['files'][name] = entry
+        with (backup / 'manifest.json').open('x') as stream:
+            json.dump(manifest, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish the complete backup before the first configuration change.
+        (state / 'active').symlink_to(Path('backups') / backup.name)
+    except BaseException:
+        if not (state / 'active').is_symlink():
+            shutil.rmtree(backup)
+        raise
+    return backup, manifest
+
+
+def saved_snapshot(config, state):
+    active = state / 'active'
+    if not active.exists() and not active.is_symlink():
+        return None
+    backup = active.resolve(strict=True)
+    if not active.is_symlink() or backup.parent != (state / 'backups').resolve():
+        raise RuntimeError('Invalid active backup; original configuration has been left untouched')
+    manifest = json.loads((backup / 'manifest.json').read_text())
+    if manifest['version'] != 1 or manifest['config'] != str(config):
+        raise RuntimeError('The saved backup belongs to a different configuration directory')
+    for name in CONFIG_FILES:
+        entry = manifest['files'][name]
+        if entry['exists']:
+            digest = hashlib.sha256((backup / name).read_bytes()).hexdigest()
+            if digest != entry['sha256']:
+                raise RuntimeError(f'Backup checksum mismatch: {backup / name}')
+    return backup, manifest
+
+
+def restore_config(config, backup, manifest):
+    for name in CONFIG_FILES:
+        path = config / name
+        entry = manifest['files'][name]
+        if not entry['exists']:
+            path.unlink(missing_ok=True)
+        elif entry['link'] is not None:
+            target = Path(entry['link'])
+            if not target.is_absolute():
+                target = config / target
+            atomic_copy(backup / name, target.resolve())
+            if not path.is_symlink() or os.readlink(path) != entry['link']:
+                path.unlink(missing_ok=True)
+                path.symlink_to(entry['link'])
+        else:
+            atomic_copy(backup / name, path)
+
+
+def restore_services(manifest):
+    for unit, previous in manifest['services'].items():
+        if previous['enabled'] == 'enabled':
+            systemctl('enable', unit)
+        elif previous['enabled'] == 'enabled-runtime':
+            systemctl('enable', '--runtime', unit)
+        if previous['active']:
+            systemctl('start', unit)
+
+
+def enable(config, state):
+    systemctl('daemon-reload')
+    saved = saved_snapshot(config, state)
+    if saved is None:
+        data = [xdg_path('XDG_DATA_HOME', Path.home() / '.local/share')]
+        data += [Path(p) for p in (os.environ.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share').split(':')]
+        if not any((p / 'plasma/shells' / SHELL_ID / 'contents/defaults').is_file() for p in data):
+            raise RuntimeError('The NextKDE Plasma shell is not installed')
+        saved = snapshot(config, state)
+    backup, manifest = saved
+    try:
+        write_config(config, 'plasmashellrc', 'Shell', 'ShellPackage', SHELL_ID)
+        write_config(config, 'kwinrc', 'Plugins', 'blurEnabled', 'false')
+        for effect in ('kos_bridge', 'kos_dock_window_animation', 'kos_context_menu_input', 'glass'):
+            write_config(config, 'kwinrc', 'Plugins', effect + 'Enabled', 'true')
+        write_config(config, 'kwinrc', 'org.kde.kdecoration2', 'library', 'kos_decoration')
+        switch_plasma(config)
+        systemctl('enable', '--now', *UNITS)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        # Keep the backup active if any rollback step fails, so disable can retry.
+        systemctl('disable', '--now', *reversed(UNITS))
+        restore_config(config, backup, manifest)
+        switch_plasma(config)
+        restore_services(manifest)
+        (state / 'active').unlink()
+        raise
+    print(f'NextKDE enabled. Original KDE configuration: {backup}')
+    print('Log out and back in to load the selected KWin effects and decoration.')
+
+
+def disable(config, state):
+    saved = saved_snapshot(config, state)
+    systemctl('disable', '--now', *reversed(UNITS))
+    if saved is None:
+        print('NextKDE services disabled. No saved configuration to restore.')
+        return
+    backup, manifest = saved
+    restore_config(config, backup, manifest)
+    switch_plasma(config)
+    (state / 'active').unlink()
+    print(f'NextKDE disabled. KDE configuration restored from {backup}')
+    print('Log out and back in to load the restored KWin effects and decoration.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'Run as your desktop user. enable saves kwinrc and plasmashellrc once; '
+        'disable stops and disables the three desktop services and restores those files. '
+        'Changes made to those two files while NextKDE is enabled are replaced by the backup. '
+        'Application data and package-owned service files are retained.'))
+    parser.add_argument('command', choices=('enable', 'disable'))
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        parser.error('run this command as your desktop user, without sudo')
+    os.umask(0o077)
+    try:
+        for executable in ('systemctl', 'kwriteconfig6', 'kreadconfig6', 'busctl'):
+            if shutil.which(executable) is None:
+                raise RuntimeError(f'Required command is unavailable: {executable}')
+        config = xdg_path('XDG_CONFIG_HOME', Path.home() / '.config')
+        state = xdg_path('XDG_STATE_HOME', Path.home() / '.local/state') / 'kos/switch'
+        state.mkdir(parents=True, mode=0o700, exist_ok=True)
+        config.mkdir(parents=True, exist_ok=True)
+        with (state / 'lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            (enable if args.command == 'enable' else disable)(config, state)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f'kosctl: {error}', file=sys.stderr)
+        print('Any active backup is retained; use kosctl disable to retry restoration.', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

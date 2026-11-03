@@ -510,6 +510,9 @@ if(BUILD_TESTING)
     # default table and the daemon's generated handler in agreement.
     find_program(KOS_PYTHON_EXECUTABLE NAMES python3 python)
     if(KOS_PYTHON_EXECUTABLE)
+        add_test(NAME kos-desktop.switch
+            COMMAND ${KOS_PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kosctl_switch.py)
+        set_tests_properties(kos-desktop.switch PROPERTIES LABELS logic TIMEOUT 30)
         add_test(NAME kos-window.firefox-buttons-install
             COMMAND ${KOS_PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_firefox_buttons.py)
         set_tests_properties(kos-window.firefox-buttons-install PROPERTIES LABELS logic TIMEOUT 15)
