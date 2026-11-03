@@ -152,6 +152,12 @@ class DesktopSwitchTests(unittest.TestCase):
         self.command('enable', success=False)
         self.assert_restored()
 
+    def test_disable_restores_configuration_after_unit_files_are_removed(self):
+        self.command('enable')
+        self.services.write_text('{}')
+        self.command('disable')
+        self.assert_restored()
+
     def test_only_enable_and_disable_are_accepted(self):
         self.command('install', success=False)
         self.command('update', success=False)

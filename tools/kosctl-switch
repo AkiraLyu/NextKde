@@ -153,6 +153,16 @@ def restore_services(manifest):
             systemctl('start', unit)
 
 
+def stop_services():
+    for unit in reversed(UNITS):
+        result = systemctl('show', '--property=LoadState', '--value', unit, check=False)
+        if result.stdout.strip() == 'not-found':
+            continue
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or f'Cannot query {unit}')
+        systemctl('disable', '--now', unit)
+
+
 def enable(config, state):
     systemctl('daemon-reload')
     saved = saved_snapshot(config, state)
@@ -173,7 +183,7 @@ def enable(config, state):
         systemctl('enable', '--now', *UNITS)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         # Keep the backup active if any rollback step fails, so disable can retry.
-        systemctl('disable', '--now', *reversed(UNITS))
+        stop_services()
         restore_config(config, backup, manifest)
         switch_plasma(config)
         restore_services(manifest)
@@ -185,7 +195,7 @@ def enable(config, state):
 
 def disable(config, state):
     saved = saved_snapshot(config, state)
-    systemctl('disable', '--now', *reversed(UNITS))
+    stop_services()
     if saved is None:
         print('NextKDE services disabled. No saved configuration to restore.')
         return
